@@ -20,6 +20,8 @@ make example_cpu
 ./example_cpu ../examples/im1.ppm ../examples/anno1.ppm ../examples/res1_cpu.ppm
 make example_gpu
 ./example_gpu ../examples/im1.ppm ../examples/anno1.ppm ../examples/res1_gpu.ppm
+make example_3d_gpu
+./example_3d_gpu ../examples/image.nii.gz ../examples/annotation.nii.gz ../examples/output.nii.gz
 ```
 
 ## Usage
@@ -52,31 +54,36 @@ crf.inference(10, true);
 short * map = crf.getMap();
 ```
 
-### GPU Version
+### 3D GPU Version
 
 Please note all pointers should be CUDA device pointer.
 
 ```C++
 #include "densecrf_gpu.cuh"
 #include "pairwise_gpu.cuh"
-using namespace DenseCRF;
+using namespace dcrf_cuda;
 
 // Setup the CRF model
-DenseCRFGPU<M> crf(W * H);
-crf.setUnaryEnergyFromLabel( labelGPU, 0.5 );
-// add a color independent term (feature = pixel location 0..W-1, 0..H-1)
-// x_stddev = 3
-// y_stddev = 3
-// weight = 3
-auto* smoothnessPairwise = PottsPotentialGPU<M, 2>::FromImage<>(W, H, 3.0, 3.0);
-crf.addPairwiseEnergy( smoothnessPairwise );
-// add a color dependent term (feature = xyrgb)
-// x_stddev = 60
-// y_stddev = 60
-// r_stddev = g_stddev = b_stddev = 20
-// weight = 10
-auto* appearancePairwise = PottsPotentialGPU<M, 5>::FromImage<float>(W, H, 10.0, 60.0, rgbFeatGPU, 20.0);
-crf.addPairwiseEnergy( appearancePairwise );
+DenseCRFGPU<M> crf(W * H * D);
+crf.setUnaryEnergy(unary_dev);
+// Add 3D smoothness term
+auto* smooth3d = PottsPotentialGPU<M,3>::FromImage3D<float>(
+    W, H, D,
+    3.0f,    // weight
+    3.0f,    // posdev
+    nullptr, // features
+    0.0f     // featuredev
+);
+crf.addPairwiseEnergy(smooth3d);
+// Add 3D appearance term
+auto* appear3d = PottsPotentialGPU<M,4>::FromImage3D(
+    W, H, D,
+    /*weight=*/10.0f,
+    /*posdev=*/60.0f,
+    /*features=*/imgGPU,
+    /*featuredev=*/20.0f
+);
+crf.addPairwiseEnergy(appear3d);
 // Do map inference
 crf.inference(10, true);
 short * mapGPU = crf.getMap();
