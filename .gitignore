@@ -1,3 +1,5 @@
 .idea/
 .vscode/
 build/
+*.nii.gz
+.DS_Store
