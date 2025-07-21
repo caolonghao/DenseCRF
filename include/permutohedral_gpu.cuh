@@ -24,6 +24,8 @@ SOFTWARE.*/
 
 #define BLOCK_SIZE 256
 
+#define MAX_GRID_DIM 65535
+
 #include <cstdio>
 #include <utility>
 #include <iostream>
@@ -149,9 +151,15 @@ __global__ static void createLattice(const int n,
                                      MatrixEntry<T> *matrix,
                                      HashTableGPU<T, pd, vd> table) {
 
-    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    // const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
+    const int idx = threadIdx.x + blockId * blockDim.x;
     if (idx >= n)
         return;
+
+    // if (idx==0) printf("createLattice launch n=%d grid=(%d,%d) block=(%d)\n",
+    //                n, gridDim.x, gridDim.y, blockDim.x);
+    // if (idx==n-1) printf("last index reached\n");
 
     T elevated[pd + 1];
     const T *position = positions + idx * pd;
@@ -244,7 +252,9 @@ __global__ static void createLattice(const int n,
 template<typename T, int pd, int vd>
 __global__ static void cleanHashTable(int n, HashTableGPU<T, pd, vd> table) {
 
-    const int idx = (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x * blockDim.y + threadIdx.x;
+    // const int idx = (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x * blockDim.y + threadIdx.x;
+    const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
+    const int idx = threadIdx.x + blockId * blockDim.x;
 
     if (idx >= n)
         return;
@@ -267,9 +277,12 @@ __global__ static void cleanHashTable(int n, HashTableGPU<T, pd, vd> table) {
 template<typename T, int pd, int vd>
 __global__ static void splatCache(const int n, const T *values, MatrixEntry<T> *matrix, HashTableGPU<T, pd, vd> table, bool isInit) {
 
-    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
+    const int idx = threadIdx.x + blockId * blockDim.x;
+    const int color = blockIdx.z; // 从 z 维度获取 color
+    // const int idx = threadIdx.x + blockIdx.x * blockDim.x;
     const int threadId = threadIdx.x;
-    const int color = blockIdx.y;
+    // const int color = blockIdx.y;
     const bool outOfBounds = (idx >= n);
 
     __shared__ int sharedOffsets[BLOCK_SIZE];
@@ -332,13 +345,22 @@ __global__ static void splatCache(const int n, const T *values, MatrixEntry<T> *
 template<typename T, int pd, int vd>
 __global__ static void blur(int n, T *newValues, MatrixEntry<T> *matrix, int color, HashTableGPU<T, pd, vd> table) {
 
-    const int idx = (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x * blockDim.y + threadIdx.x;
+    // const int idx = (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x * blockDim.y + threadIdx.x;
+    const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
+    const int idx = threadIdx.x + blockId * blockDim.x;
     if (idx >= n)
         return;
 
     // Check if I'm valid
-    if (matrix[idx].index != idx)
+    T *valMe_check = table.values + vd * idx;
+    if (valMe_check[vd - 1] == 0) {
+        // 这个晶格点没有被使用。将其输出设置为0并返回。
+        T* valOut_check = newValues + vd * idx;
+        for (int i = 0; i < vd; i++) {
+            valOut_check[i] = 0;
+        }
         return;
+    }
 
 
     // find my key and the keys of my neighbors
@@ -379,7 +401,9 @@ __global__ static void blur(int n, T *newValues, MatrixEntry<T> *matrix, int col
 template<typename T, int pd, int vd>
 __global__ static void slice(const int n, T *values, MatrixEntry<T> *matrix, HashTableGPU<T, pd, vd> table) {
 
-    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    // const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
+    const int idx = threadIdx.x + blockId * blockDim.x;
     if (idx >= n)
         return;
 
@@ -448,10 +472,10 @@ public:
             newValues(nullptr),
             hashTable(HashTableGPU<T, pd, vd>(n * (pd + 1))) {
 
-        if (n >= 65535 * BLOCK_SIZE) {
-            printf("Not enough GPU memory (on x axis, you can change the code to use other grid dims)\n");
-            //this should crash the program
-        }
+        // if (n >= 65535 * BLOCK_SIZE) {
+        //     printf("Not enough GPU memory (on x axis, you can change the code to use other grid dims)\n");
+        //     //this should crash the program
+        // }
         filterTimes = 0;
         // initialize device memory
 //        TicToc::tic("PL: Meminit " + std::to_string(
@@ -478,39 +502,118 @@ public:
     }
 
     // values and position must already be device pointers
+    // void prepare(const T* positions) {
+    //     dim3 blocks((n - 1) / BLOCK_SIZE + 1, 1, 1);
+    //     dim3 blockSize(BLOCK_SIZE, 1, 1);
+    //     int cleanBlockSize = 128;
+    //     dim3 cleanBlocks((n - 1) / cleanBlockSize + 1, 2 * (pd + 1), 1);
+
+    //     createLattice<T, pd, vd> <<<blocks, blockSize>>>(n, positions, scaleFactor, matrix, hashTable);
+    //     cudaErrorCheck();
+
+    //     cleanHashTable<T, pd, vd> <<<cleanBlocks, cleanBlockSize>>>(2 * n * (pd + 1), hashTable);
+    //     cudaErrorCheck();
+    // }
+
     void prepare(const T* positions) {
-        dim3 blocks((n - 1) / BLOCK_SIZE + 1, 1, 1);
+        // --- 修改开始 ---
+        // 将一维网格计算改为二维，以避免超出维度限制
         dim3 blockSize(BLOCK_SIZE, 1, 1);
+        int n_blocks = (n - 1) / BLOCK_SIZE + 1;
+        dim3 blocks(1, 1, 1);
+        if (n_blocks > MAX_GRID_DIM) {
+            blocks.x = MAX_GRID_DIM;
+            blocks.y = (n_blocks - 1) / MAX_GRID_DIM + 1;
+        } else {
+            blocks.x = n_blocks;
+        }
+        
+        // cleanHashTable 的网格计算也需要修改
         int cleanBlockSize = 128;
-        dim3 cleanBlocks((n - 1) / cleanBlockSize + 1, 2 * (pd + 1), 1);
+        int n_clean_items = 2 * n * (pd + 1);
+        int n_clean_blocks = (n_clean_items - 1) / cleanBlockSize + 1;
+        dim3 cleanBlocks(1, 1, 1);
+         if (n_clean_blocks > MAX_GRID_DIM) {
+            cleanBlocks.x = MAX_GRID_DIM;
+            cleanBlocks.y = (n_clean_blocks - 1) / MAX_GRID_DIM + 1;
+        } else {
+            cleanBlocks.x = n_clean_blocks;
+        }
+        // --- 修改结束 ---
 
         createLattice<T, pd, vd> <<<blocks, blockSize>>>(n, positions, scaleFactor, matrix, hashTable);
         cudaErrorCheck();
 
-        cleanHashTable<T, pd, vd> <<<cleanBlocks, cleanBlockSize>>>(2 * n * (pd + 1), hashTable);
+        // 注意: cleanHashTable kernel 也需要修改索引计算方式才能与新的 cleanBlocks 配合
+        // 这里为了简单起见，假设 cleanHashTable 不是性能瓶颈，或者其内部索引计算已相应修改
+        cleanHashTable<T, pd, vd> <<<cleanBlocks, cleanBlockSize>>>(n_clean_items, hashTable);
         cudaErrorCheck();
     }
 
-    // values and position must already be device pointers
+    // // values and position must already be device pointers
+    // void filter(T* output, const T* inputs, bool reverse = false) {
+    //     dim3 blocks((n - 1) / BLOCK_SIZE + 1, pd + 1, 1);
+    //     dim3 blockSize(BLOCK_SIZE, 1, 1);
+    //     int cleanBlockSize = 128;
+    //     dim3 cleanBlocks((n - 1) / cleanBlockSize + 1, 2 * (pd + 1), 1);
+
+    //     cudaMemset((void*)(hashTable.values), 0, hashTable.capacity * vd * sizeof(T));
+
+    //     splatCache<T, pd, vd><<<blocks, blockSize>>>(n, inputs, matrix, hashTable, filterTimes == 0);
+    //      cudaErrorCheck();
+
+    //     for (int remainder=reverse?pd:0; remainder >= 0 && remainder <= pd; reverse?remainder--:remainder++) {
+    //         blur<T, pd, vd><<<cleanBlocks, cleanBlockSize>>>(n * (pd + 1), newValues, matrix, remainder, hashTable);
+    //          cudaErrorCheck();
+    //         std::swap(hashTable.values, newValues);
+    //     }
+    //     blockSize.y = 1;
+    //     slice<T, pd, vd><<<blocks, blockSize>>>(n, output, matrix, hashTable);
+    //      cudaErrorCheck();
+    //     ++filterTimes;
+    // }
     void filter(T* output, const T* inputs, bool reverse = false) {
-        dim3 blocks((n - 1) / BLOCK_SIZE + 1, pd + 1, 1);
+        // --- 修改开始 ---
+        // 为 splat 和 slice 计算二维网格，并将颜色/循环维度放到第三维(z)
         dim3 blockSize(BLOCK_SIZE, 1, 1);
+        int n_pixel_blocks = (n - 1) / BLOCK_SIZE + 1;
+        dim3 splat_slice_blocks(1, 1, 1);
+        if (n_pixel_blocks > MAX_GRID_DIM) {
+            splat_slice_blocks.x = MAX_GRID_DIM;
+            splat_slice_blocks.y = (n_pixel_blocks - 1) / MAX_GRID_DIM + 1;
+        } else {
+            splat_slice_blocks.x = n_pixel_blocks;
+        }
+        splat_slice_blocks.z = pd + 1; // 将颜色维度放到z轴
+
+        // 为 blur 计算二维网格
         int cleanBlockSize = 128;
-        dim3 cleanBlocks((n - 1) / cleanBlockSize + 1, 2 * (pd + 1), 1);
+        int n_blur_items = n * (pd + 1);
+        int n_blur_blocks = (n_blur_items - 1) / cleanBlockSize + 1;
+        dim3 blur_blocks(1, 1, 1);
+        if (n_blur_blocks > MAX_GRID_DIM) {
+            blur_blocks.x = MAX_GRID_DIM;
+            blur_blocks.y = (n_blur_blocks - 1) / MAX_GRID_DIM + 1;
+        } else {
+            blur_blocks.x = n_blur_blocks;
+        }
+        // --- 修改结束 ---
 
         cudaMemset((void*)(hashTable.values), 0, hashTable.capacity * vd * sizeof(T));
 
-        splatCache<T, pd, vd><<<blocks, blockSize>>>(n, inputs, matrix, hashTable, filterTimes == 0);
-         cudaErrorCheck();
+        splatCache<T, pd, vd><<<splat_slice_blocks, blockSize>>>(n, inputs, matrix, hashTable, filterTimes == 0);
+        cudaErrorCheck();
 
         for (int remainder=reverse?pd:0; remainder >= 0 && remainder <= pd; reverse?remainder--:remainder++) {
-            blur<T, pd, vd><<<cleanBlocks, cleanBlockSize>>>(n * (pd + 1), newValues, matrix, remainder, hashTable);
-             cudaErrorCheck();
+            blur<T, pd, vd><<<blur_blocks, cleanBlockSize>>>(n_blur_items, newValues, matrix, remainder, hashTable);
+            cudaErrorCheck();
             std::swap(hashTable.values, newValues);
         }
-        blockSize.y = 1;
-        slice<T, pd, vd><<<blocks, blockSize>>>(n, output, matrix, hashTable);
-         cudaErrorCheck();
+        
+        // slice kernel 的启动配置与 splat 类似，但 z 维度应为1
+        splat_slice_blocks.z = 1;
+        slice<T, pd, vd><<<splat_slice_blocks, blockSize>>>(n, output, matrix, hashTable);
+        cudaErrorCheck();
         ++filterTimes;
     }
 };
