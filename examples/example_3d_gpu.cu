@@ -11,6 +11,7 @@
 #include "pairwise_gpu.cuh"
 #include "crf_utils.h"
 #include "nifti1_io.h"
+#include "crf_utils_gpu.cuh"
 
 using namespace dcrf_cuda;
 using namespace std::chrono;
@@ -25,7 +26,8 @@ void print_usage(const char* prog_name) {
               << " [--confidence_strategy <1-4>]"
               << " [--smooth3d_w <float>] [--smooth3d_posdev <float>]"
               << " [--appear3d_w <float>] [--appear3d_posdev <float>] [--appear3d_featuredev <float>]"
-              << " [--inference_iter <int>]\n";
+              << " [--inference_iter <int>]"
+              << " [--local_radius <int>]  (0=disable local stats in strategy 3)\n";
 }
 
 int main(int argc, char** argv) {
@@ -48,6 +50,7 @@ int main(int argc, char** argv) {
     }
 
     // Default CRF parameters
+    int local_radius = 2;   // 默认 2（5x5x5 体素窗口）；设为 0 可关闭（策略3下不再构建积分体）
     int confidence_strategy = 3;
     float smooth3d_w = 0.3f;
     float smooth3d_posdev = 2.5f;
@@ -64,6 +67,10 @@ int main(int argc, char** argv) {
     if (args.count("--appear3d_posdev")) appear3d_posdev = std::stof(args["--appear3d_posdev"]);
     if (args.count("--appear3d_featuredev")) appear3d_featuredev = std::stof(args["--appear3d_featuredev"]);
     if (args.count("--inference_iter")) inference_iter = std::stoi(args["--inference_iter"]);
+    if (args.count("--local_radius")) local_radius = std::stoi(args["--local_radius"]);
+    // 简单约束，避免极端值；如需更大窗口可自行调高上限
+    if (local_radius < 0) local_radius = 0;
+    if (local_radius > 8) local_radius = 8;
 
     std::cout << "--- CRF Parameters ---\n"
               << "confidence_strategy: " << confidence_strategy << "\n"
@@ -73,6 +80,7 @@ int main(int argc, char** argv) {
               << "appear3d_posdev: " << appear3d_posdev << "\n"
               << "appear3d_featuredev: " << appear3d_featuredev << "\n"
               << "inference_iter: " << inference_iter << "\n"
+              << "local_radius: " << local_radius << "\n"
               << "----------------------\n";
 
     // --- 1) Read input image ---
@@ -177,40 +185,69 @@ int main(int argc, char** argv) {
     // crf.setUnaryEnergyFromLabel(labelGPU, 0.5f);
 
 
-    // std::vector<float> unary_host(N * M);
-    // for (size_t i=0; i<N; ++i){
-    //     bool fg = (hostAnno[i] == 0); // 原逻辑: 原 mask=1 => hostAnno=0
-    //     float p = fg ? 0.975f : 0.025f;  // 可调: 0.85/0.1 等
-    //     unary_host[i*M + 1] = -logf(p);
-    //     unary_host[i*M + 0] = -logf(1.0f - p);
-    // }
+    // >>> GPU unary begin（积分体版）
+    const int max_dist = 8;        // 与原逻辑一致
+    uint8_t *dist_prev = nullptr, *dist_next = nullptr;
+    bool need_distance     = (confidence_strategy == 1 || confidence_strategy == 3);
+    bool need_local_stats  = (confidence_strategy == 3);
 
-    std::vector<float> unary_host(N * M);
-    
-    std::cout << "Calculating dynamic confidence..." << std::endl;
-    auto conf_start = std::chrono::high_resolution_clock::now();
-    
-    // 选择策略：
-    // 1 = 基于距离
-    // 2 = 基于梯度  
-    // 3 = 混合策略（推荐）
-    // 4 = 自适应边界
-    
-    calculateDynamicConfidence(hostImg, hostAnno, unary_host, W, H, D, M, confidence_strategy);
-    
-    auto conf_end = std::chrono::high_resolution_clock::now();
-    std::cout << "Dynamic confidence calculation time: "
-              << std::chrono::duration<double,std::milli>(conf_end - conf_start).count()
-              << " ms" << std::endl;
+    // 1) （可选）距离（BFS）
+    if (need_distance){
+        cudaMalloc(&dist_prev, sizeof(uint8_t) * N);
+        cudaMalloc(&dist_next, sizeof(uint8_t) * N);
+        {
+            dim3 blk(256);
+            dim3 grd( (N + blk.x - 1) / blk.x );
+            init_distance_kernel<<<grd, blk>>>(labelGPU, dist_prev, (int)N);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        for (int t = 1; t <= max_dist; ++t){
+            CUDA_CHECK(cudaMemcpy(dist_next, dist_prev, sizeof(uint8_t)*N, cudaMemcpyDeviceToDevice));
+            dim3 blk(256);
+            dim3 grd( (N + blk.x - 1) / blk.x );
+            bfs_expand_kernel<<<grd, blk>>>(dist_prev, dist_next, labelGPU, W, H, D, (uint8_t)t);
+            CUDA_CHECK(cudaGetLastError());
+            uint8_t* tmp = dist_prev; dist_prev = dist_next; dist_next = tmp;
+        }
+    }
 
-    // Free host image buffer if we allocated one
-    if (img->datatype != NIFTI_TYPE_FLOAT32) delete[] hostImg;
+    // 2) （可选）构建 3D 积分体（仅策略 3 需要）
+    float *sat1 = nullptr, *sat2 = nullptr;
+    if (need_local_stats){
+        build_integral3d(imgGPU, W, H, D, sat1, sat2);
+    }
 
-    float* unary_dev;
+    // 3) 直接在 GPU 上生成 unary
+    float* unary_dev = nullptr;
     cudaMalloc(&unary_dev, sizeof(float)*N*M);
-    cudaMemcpy(unary_dev, unary_host.data(), sizeof(float)*N*M, cudaMemcpyHostToDevice);
+    {
+        dim3 blk(256);
+        dim3 grd( (N + blk.x - 1) / blk.x );
+        compute_unary_kernel<<<grd, blk>>>(
+            imgGPU, labelGPU,
+            need_distance ? dist_prev : nullptr,
+            need_local_stats ? sat1 : nullptr,
+            need_local_stats ? sat2 : nullptr,
+            unary_dev, W, H, D, M,
+            confidence_strategy,
+            max_dist, local_radius
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    
     crf.setUnaryEnergy(unary_dev);
     cudaFree(unary_dev);
+
+    // 清理
+    if (need_distance){
+        cudaFree(dist_prev);
+        cudaFree(dist_next);
+    }
+    if (need_local_stats){
+        cudaFree(sat1);
+        cudaFree(sat2);
+    }
 
     // Pairwise: 3D smoothness (xyz)
     auto* smooth3d = PottsPotentialGPU<M,3>::FromImage3D<float>(
